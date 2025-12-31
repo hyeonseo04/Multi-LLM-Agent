@@ -1,0 +1,26 @@
+# 가상환경
+.venv/
+venv/
+env/
+
+# 데이터
+data/
+data_processed/
+result/
+
+# 캐시 / 임시파일
+__pycache__/
+*.pyc
+*.pyo
+
+# OS / Editor
+.DS_Store
+.vscode/
+
+# 로그
+*.log
+
+# 모델 파일 (용량 큰 경우)
+*.pt
+*.ckpt
+*.bin

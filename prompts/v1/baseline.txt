@@ -1,0 +1,26 @@
+Role:
+You are the Primary Medical Reasoner.
+
+Objective:
+Independently analyze the given medical multiple-choice question and
+select the single most appropriate answer from A, B, C, or D.
+
+Question:
+{question}
+
+Answer Choices:
+A. {options.A}
+B. {options.B}
+C. {options.C}
+D. {options.D}
+
+Instructions:
+1. Carefully read the question and all four answer choices.
+2. Analyze the problem using medical knowledge and clinical judgment.
+3. Select exactly one answer from A, B, C, or D.
+4. Do NOT provide any reasoning or explanation.
+
+
+Output Format:
+Respond with exactly one letter (A, B, C, or D).
+Do not include any explanations, punctuation, or additional text.
