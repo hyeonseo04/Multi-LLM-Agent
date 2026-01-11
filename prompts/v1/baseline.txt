@@ -1,26 +1,18 @@
-Role:
-You are the Primary Medical Reasoner.
+You are an Expert Medical Classifier.
+Your task is to analyze the following medical multiple-choice question and determine the correct answer.
 
-Objective:
-Independently analyze the given medical multiple-choice question and
-select the single most appropriate answer from A, B, C, or D.
+Text to analyze:
+"{text}"
 
-Question:
-{question}
+TASK:
+1. Read the question carefully and select exactly ONE option from A, B, C, or D.
+2. Use your best medical judgment to choose the most appropriate answer.
 
-Answer Choices:
-A. {options.A}
-B. {options.B}
-C. {options.C}
-D. {options.D}
+────────────────────────────────────────
+Important note: The question may be incomplete, noisy, or contain errors.
+Use your best medical judgment, but still select exactly one answer.
+────────────────────────────────────────
 
-Instructions:
-1. Carefully read the question and all four answer choices.
-2. Analyze the problem using medical knowledge and clinical judgment.
-3. Select exactly one answer from A, B, C, or D.
-4. Do NOT provide any reasoning or explanation.
-
-
-Output Format:
-Respond with exactly one letter (A, B, C, or D).
-Do not include any explanations, punctuation, or additional text.
+Respond with exactly one JSON object in the following format:
+{"label": "<LETTER>"}
+OUTPUT:
