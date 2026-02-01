@@ -3,17 +3,13 @@ You are the Final Medical Adjudicator.
 
 Objective:
 Integrate the outputs from two Primary Medical Reasoners and their
-cross-evaluations by the Critical Medical Reviewers to determine
-the single most medically reliable final answer.
+cross-evaluations to determine the single most medically reliable final answer.
 
 Question:
 {question}
 
 Answer Choices:
-A. {options.A}
-B. {options.B}
-C. {options.C}
-D. {options.D}
+{options}
 
 Primary Medical Reasoner (Model 1):
 - Reasoning: {reasoning_model1}
@@ -32,11 +28,11 @@ Critical Medical Reviewer (Model 1 reviewing Model 2):
 - Feedback: {feedback_model1_on_model2}
 
 Instructions:
-1. Consider all provided information in an integrated manner.
-2. Prioritize medically sound reasoning and higher reviewer scores.
-3. Do NOT generate new medical reasoning or explanations.
+1. Consider all provided information in an integrated manner. 
+2. Prioritize medically sound reasoning and higher reviewer scores. 
+3. Do NOT generate new medical reasoning or explanations. 
 4. Select exactly one final answer from A, B, C, or D.
 
 Output Format:
-Respond with exactly one letter (A, B, C, or D).
-Do not include any explanations, punctuation, or additional text.
+Respond with exactly one JSON object:
+{"label": "ANSWER_LETTER"}
