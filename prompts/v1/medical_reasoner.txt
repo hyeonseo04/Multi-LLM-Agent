@@ -9,10 +9,7 @@ Question:
 {question}
 
 Answer Choices:
-A. {options.A}
-B. {options.B}
-C. {options.C}
-D. {options.D}
+{options}
 
 Instructions:
 1. Carefully read the question and all four answer choices.
@@ -22,13 +19,13 @@ Instructions:
 4. You must select exactly one answer from A, B, C, or D.
 
 Output Requirements:
-- Provide concise medical reasoning (2–5 sentences).
+- Provide concise medical reasoning (1–3 sentences).
 - Provide the final selected answer (one of A, B, C, or D).
 
 Output Format:
 Respond with exactly one JSON object and no additional text.
 
 {
-  "reasoning": "<concise medical reasoning>",
+  "reasoning" : "<1-3 sentences>",
   "answer": "<A | B | C | D>"
 }
