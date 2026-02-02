@@ -230,7 +230,20 @@ def main():
             print(f"Processing file: {in_path}")
             print(f"[Error] Input not found: {in_path}")
             continue
-
+        
+        # 출력 파일 경로 확인
+        base = out_path
+        if base.suffix.lower() in (".csv", ".jsonl", ".json"):
+            base = base.with_suffix("")
+        
+        csv_path = base.with_suffix(".csv")
+        jsonl_path = base.with_suffix(".jsonl")
+        
+        # 이미 두 파일이 모두 존재하면 스킵
+        if csv_path.exists() and jsonl_path.exists():
+            print(f"[Skipped] Output already exists: {csv_path}")
+            continue
+        
         # 파일 처리 시작 로그
         print(f"Processing file: {in_path}")
 
