@@ -8,6 +8,10 @@ run_multiagent_model_centric.py
 3. Load A -> Check if done -> Run (Review A->B) -> Unload A
 4. Adjudicator -> Check if done -> Run (Final Decision) -> Unload
    * Stage 2: Forced Decoding (A/B/C/D), Token Stats, CSV+JSONL Output
+   
+타임아웃 시   
+export HF_HUB_HTTP_TIMEOUT=60
+export HF_HUB_ETAG_TIMEOUT=60
 """
 
 import os, re, gc, json, glob, time
