@@ -27,6 +27,7 @@ from transformers import (
     BitsAndBytesConfig, LogitsProcessor, LogitsProcessorList
 )
 from transformers.utils import logging as hf_logging
+
 # =========================
 # Quiet / Env safety
 # =========================
@@ -86,7 +87,11 @@ CONFIG = {
         "oom_fallback": True,
         "warn_missing_placeholders": False,
         "torch_compile": True,
-    }
+    },
+    
+    # ✅ Clean 데이터용 5개 random seed
+    "clean_seeds": [42, 123, 456, 789, 1024],
+    "default_seed": 42,
 }
 
 # =========================================================
@@ -103,7 +108,7 @@ def parse_path_info(input_path: str) -> Tuple[str, str, str]:
             level = parts[1]
             seed_tag = parts[2].replace(".jsonl", "")
             return noise, level, seed_tag
-    return "clean", "clean", "test_run"
+    return "clean", "clean", "seed_0"
 
 def read_text(p: Path) -> str:
     if not p.exists():
@@ -121,11 +126,6 @@ def apply_chat(tokenizer, user_text: str) -> str:
     except: pass
     return f"User:\n{user_text}\n\nAssistant:"
 
-# =========================================================
-# Utilities (Missing Functions)
-# =========================================================
-
-# 1. 이 함수가 없어서 에러가 났습니다! (반드시 추가)
 def safe_format_prompt(template: str, **kwargs) -> str:
     # 템플릿 내의 {변수}를 잠시 임시 토큰으로 변경
     placeholders = re.findall(r"\{(\w+)\}", template)
@@ -145,7 +145,6 @@ def safe_format_prompt(template: str, **kwargs) -> str:
     
     return template.format(**skw)
 
-# 2. (혹시 안 넣으셨다면) 이 함수도 꼭 있어야 합니다.
 def format_options(options):
     if isinstance(options, str): 
         try:
@@ -171,7 +170,7 @@ def safe_format(template: str, **kw) -> str:
 
 def _normalize_and_extract_json(s: str) -> Optional[str]:
     if not isinstance(s, str) or not s.strip(): return None
-    s = s.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+    s = s.replace(""", '"').replace(""", '"').replace("'", "'").replace("'", "'")
     m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", s)
     if m: s = m.group(1).strip()
     start = s.find("{")
@@ -339,245 +338,269 @@ def batched_generate_with_fallback_local(generate_fn, prompts: List[str], batch_
     return outs
 
 # =========================================================
-# STAGE 1: Model-Centric Logic (Maintained)
+# 단일 파일 + 단일 Seed 처리 함수 (Stage 1 전체)
 # =========================================================
-def run_stage1_model_centric(files: List[str], prompts: dict):
+def run_stage1_single_file_seed(
+    input_path: str,
+    noise: str,
+    level: str,
+    seed_tag: str,
+    actual_seed: int,
+    prompts: dict,
+):
+    """
+    하나의 파일을 하나의 seed로 Stage 1 전체 실행
+    (Phase 1: A, Phase 2: B + Review B->A, Phase 3: Review A->B)
+    """
+    # Seed 설정
+    torch.manual_seed(actual_seed)
+    torch.cuda.manual_seed_all(actual_seed)
+    
+    work_dir = RESULTS_ROOT / noise / level / seed_tag
+    work_dir.mkdir(parents=True, exist_ok=True)
+    stage1_path = work_dir / "stage1_results.jsonl"
+    
     reasoner_tmpl = prompts["reasoner"]
     reviewer_tmpl = prompts["reviewer"]
-    bs = int(CONFIG["batch_size"]) # 기본 배치 사이즈 (32)
-    
-    # ... (Stage 1 Phase 1, 2, 3 Code Omitted for Brevity - It remains exactly the same) ...
-    # [NOTE] Stage 1 코드는 원본과 동일하게 유지됩니다. 
-    # 편의상 여기서는 생략하고 Stage 2에 집중합니다. 실제 실행 시에는 위 코드의 Stage 1 부분을 그대로 두세요.
+    bs = int(CONFIG["batch_size"])
     
     # =========================================================================
     # Phase 1: Reasoner A
     # =========================================================================
-    print(f"\n{'='*60}\n[Phase 1/3] Check & Run: Reasoner A\n{'='*60}")
+    print(f"\n[Phase 1/3] {noise}/{level}/{seed_tag} (seed={actual_seed}) - Reasoner A")
     
-    todo_files_a = []
-    for fp in files:
-        noise, level, seed_tag = parse_path_info(fp)
-        work_dir = RESULTS_ROOT / noise / level / seed_tag
-        stage1_path = work_dir / "stage1_results.jsonl"
-        
-        if not stage1_path.exists():
-            todo_files_a.append(fp)
-            continue
-            
+    need_phase1 = True
+    if stage1_path.exists():
         try:
             df = pd.read_json(stage1_path, lines=True)
-            if "answer_A" not in df.columns or not df["answer_A"].astype(str).str.strip().all():
-                todo_files_a.append(fp)
+            if "answer_A" in df.columns and df["answer_A"].astype(str).str.strip().all():
+                need_phase1 = False
+                print("  [Skip] Answer A already exists")
         except:
-            todo_files_a.append(fp)
-
-    if not todo_files_a:
-        print("[Skip] All files already have Answer A. Skipping Phase 1.")
-    else:
+            pass
+    
+    if need_phase1:
         tok, mdl, dev = load_model_auto(CONFIG['models']['reasoner_A'], quant4bit=CONFIG['quant_4bit']['reasoner_A'])
         
-        for input_path in tqdm(todo_files_a, desc="[Phase 1] Files"):
-            file_start = time.time()
-            noise, level, seed_tag = parse_path_info(input_path)
-            work_dir = RESULTS_ROOT / noise / level / seed_tag
-            work_dir.mkdir(parents=True, exist_ok=True)
-            stage1_path = work_dir / "stage1_results.jsonl"
-            
-            if stage1_path.exists(): df = pd.read_json(stage1_path, lines=True)
-            else: df = pd.read_json(input_path, lines=True)
+        file_start = time.time()
+        
+        if stage1_path.exists():
+            df = pd.read_json(stage1_path, lines=True)
+        else:
+            df = pd.read_json(input_path, lines=True)
 
-            tqdm.write(f"  [Run] {noise}/{level}/{seed_tag} Generating A...")
+        for c in ["reasoning_A", "answer_A", "raw_reasoner_A"]:
+            if c not in df.columns:
+                df[c] = ""
+        
+        target_questions = [r.get("noisy_question") if r.get("noisy_question") else r["question"] for _, r in df.iterrows()]
+        
+        p_list = []
+        for i, r in df.iterrows():
+            if df.iloc[i]["answer_A"]:
+                p_list.append("dummy")
+            else:
+                opts = r["options"] if isinstance(r["options"], dict) else {}
+                formatted_opts = format_options(opts)
+                p_list.append(safe_format(reasoner_tmpl, question=target_questions[i], options=formatted_opts))
+        
+        todo_indices = [i for i, p in enumerate(p_list) if p != "dummy"]
+        if todo_indices:
+            real_prompts = [p_list[i] for i in todo_indices]
+            def _gen(chunk):
+                return generate_full_output(mdl, tok, chunk, 
+                    max_len=CONFIG["max_length"]["reasoner"], max_new=CONFIG["max_new_tokens"]["reasoner"],
+                    do_sample=CONFIG["sampling"]["reasoner_A"]["do_sample"], 
+                    temperature=CONFIG["sampling"]["reasoner_A"]["temperature"], device=dev)
             
-            for c in ["reasoning_A", "answer_A", "raw_reasoner_A"]:
-                if c not in df.columns: df[c] = ""
+            raw_outs = batched_generate_with_fallback_local(_gen, real_prompts, bs, desc="ReasonA")
             
-            target_questions = [r.get("noisy_question") if r.get("noisy_question") else r["question"] for _, r in df.iterrows()]
-            
-            p_list = []
-            for i, r in df.iterrows():
-                if df.iloc[i]["answer_A"]: p_list.append("dummy")
-                else:
-                    opts = r["options"] if isinstance(r["options"], dict) else {}
-                    formatted_opts = format_options(opts)
-                    p_list.append(safe_format(reasoner_tmpl, question=target_questions[i], options=formatted_opts))
-            
-            todo_indices = [i for i, p in enumerate(p_list) if p != "dummy"]
-            if todo_indices:
-                real_prompts = [p_list[i] for i in todo_indices]
-                def _gen(chunk):
-                    return generate_full_output(mdl, tok, chunk, 
-                        max_len=CONFIG["max_length"]["reasoner"], max_new=CONFIG["max_new_tokens"]["reasoner"],
-                        do_sample=CONFIG["sampling"]["reasoner_A"]["do_sample"], temperature=CONFIG["sampling"]["reasoner_A"]["temperature"], device=dev)
+            for idx, raw in zip(todo_indices, raw_outs):
+                parsed = parse_reasoner_json_robust(raw)
+                df.at[idx, "raw_reasoner_A"] = raw
+                df.at[idx, "answer_A"] = parsed["answer"]
+                df.at[idx, "reasoning_A"] = parsed["reasoning"]
                 
-                raw_outs = batched_generate_with_fallback_local(_gen, real_prompts, bs, desc="ReasonA")
-                
-                for idx, raw in zip(todo_indices, raw_outs):
-                    parsed = parse_reasoner_json_robust(raw)
-                    df.at[idx, "raw_reasoner_A"] = raw
-                    df.at[idx, "answer_A"] = parsed["answer"]
-                    df.at[idx, "reasoning_A"] = parsed["reasoning"]
-                    
-            df.to_json(stage1_path, orient="records", lines=True, force_ascii=False)
-            elapsed = time.time() - file_start
-            tqdm.write(f"  >>> Done. ⏱ Time: {str(timedelta(seconds=int(elapsed)))}")
-
+        df.to_json(stage1_path, orient="records", lines=True, force_ascii=False)
+        elapsed = time.time() - file_start
+        print(f"  >>> Done. ⏱ Time: {str(timedelta(seconds=int(elapsed)))}")
+        
         del mdl, tok
         force_clean_gpu()
-
-    # =========================================================================
-    # Phase 2: Reasoner B
-    # =========================================================================
-    print(f"\n{'='*60}\n[Phase 2/3] Check & Run: Reasoner B\n{'='*60}")
     
-    todo_files_b = []
-    for fp in files:
-        noise, level, seed_tag = parse_path_info(fp)
-        stage1_path = RESULTS_ROOT / noise / level / seed_tag / "stage1_results.jsonl"
-        if not stage1_path.exists(): continue
-
+    # =========================================================================
+    # Phase 2: Reasoner B + Review B->A
+    # =========================================================================
+    print(f"\n[Phase 2/3] {noise}/{level}/{seed_tag} - Reasoner B + Review B->A")
+    
+    need_phase2 = True
+    if stage1_path.exists():
         try:
             df = pd.read_json(stage1_path, lines=True)
             cols = ["answer_B", "review_feedback_B_on_A"]
-            needs_work = False
-            for c in cols:
-                if c not in df.columns or not df[c].astype(str).str.strip().all():
-                    needs_work = True; break
-            if needs_work: todo_files_b.append(fp)
-        except: pass
-
-    if not todo_files_b:
-        print("[Skip] All files already have Answer B & Review B->A.")
-    else:
+            if all(c in df.columns and df[c].astype(str).str.strip().all() for c in cols):
+                need_phase2 = False
+                print("  [Skip] Answer B & Review B->A already exist")
+        except:
+            pass
+    
+    if need_phase2:
         tok, mdl, dev = load_model_auto(CONFIG['models']['reasoner_B'], quant4bit=CONFIG['quant_4bit']['reasoner_B'])
         
-        for input_path in tqdm(todo_files_b, desc="[Phase 2] Files"):
-            file_start = time.time()
-            noise, level, seed_tag = parse_path_info(input_path)
-            stage1_path = RESULTS_ROOT / noise / level / seed_tag / "stage1_results.jsonl"
-            df = pd.read_json(stage1_path, lines=True)
-            tqdm.write(f"  [Run] {noise}/{level}/{seed_tag} Generating B & Review B->A...")
+        file_start = time.time()
+        df = pd.read_json(stage1_path, lines=True)
 
-            for c in ["reasoning_B", "answer_B", "raw_reasoner_B", "review_score_B_on_A", "review_feedback_B_on_A", "raw_review_B_on_A"]:
-                if c not in df.columns: df[c] = ""
-            target_questions = [r.get("noisy_question") if r.get("noisy_question") else r["question"] for _, r in df.iterrows()]
-            
-            # 1. Answer B
-            p_list = []
-            for i, r in df.iterrows():
-                if df.iloc[i]["answer_B"]: p_list.append("dummy")
-                else:
-                    opts = r["options"] if isinstance(r["options"], dict) else {}
-                    formatted_opts = format_options(opts)
-                    p_list.append(safe_format(reasoner_tmpl, question=target_questions[i], options=formatted_opts))
-            
-            todo_indices = [i for i, p in enumerate(p_list) if p != "dummy"]
-            if todo_indices:
-                def _gen_b(chunk):
-                    return generate_full_output(mdl, tok, chunk, 
-                        max_len=CONFIG["max_length"]["reasoner"], max_new=CONFIG["max_new_tokens"]["reasoner"],
-                        do_sample=CONFIG["sampling"]["reasoner_B"]["do_sample"], temperature=CONFIG["sampling"]["reasoner_B"]["temperature"], device=dev)
-                raw_outs = batched_generate_with_fallback_local(_gen_b, [p_list[i] for i in todo_indices], bs, desc="ReasonB")
-                for idx, raw in zip(todo_indices, raw_outs):
-                    parsed = parse_reasoner_json_robust(raw)
-                    df.at[idx, "raw_reasoner_B"] = raw
-                    df.at[idx, "answer_B"] = parsed["answer"]
-                    df.at[idx, "reasoning_B"] = parsed["reasoning"]
+        for c in ["reasoning_B", "answer_B", "raw_reasoner_B", "review_score_B_on_A", "review_feedback_B_on_A", "raw_review_B_on_A"]:
+            if c not in df.columns:
+                df[c] = ""
+        
+        target_questions = [r.get("noisy_question") if r.get("noisy_question") else r["question"] for _, r in df.iterrows()]
+        
+        # 1. Answer B
+        p_list = []
+        for i, r in df.iterrows():
+            if df.iloc[i]["answer_B"]:
+                p_list.append("dummy")
+            else:
+                opts = r["options"] if isinstance(r["options"], dict) else {}
+                formatted_opts = format_options(opts)
+                p_list.append(safe_format(reasoner_tmpl, question=target_questions[i], options=formatted_opts))
+        
+        todo_indices = [i for i, p in enumerate(p_list) if p != "dummy"]
+        if todo_indices:
+            def _gen_b(chunk):
+                return generate_full_output(mdl, tok, chunk, 
+                    max_len=CONFIG["max_length"]["reasoner"], max_new=CONFIG["max_new_tokens"]["reasoner"],
+                    do_sample=CONFIG["sampling"]["reasoner_B"]["do_sample"], 
+                    temperature=CONFIG["sampling"]["reasoner_B"]["temperature"], device=dev)
+            raw_outs = batched_generate_with_fallback_local(_gen_b, [p_list[i] for i in todo_indices], bs, desc="ReasonB")
+            for idx, raw in zip(todo_indices, raw_outs):
+                parsed = parse_reasoner_json_robust(raw)
+                df.at[idx, "raw_reasoner_B"] = raw
+                df.at[idx, "answer_B"] = parsed["answer"]
+                df.at[idx, "reasoning_B"] = parsed["reasoning"]
 
-            # 2. Review B->A
-            p_rev = []
-            for i, r in df.iterrows():
-                if df.iloc[i]["review_feedback_B_on_A"]: p_rev.append("dummy")
-                else:
-                    opts = r["options"] if isinstance(r["options"], dict) else {}
-                    formatted_opts = format_options(opts)
-                    p_rev.append(safe_format(reviewer_tmpl, question=target_questions[i], options=formatted_opts, reasoning=r["reasoning_A"], answer=r["answer_A"]))
-            
-            todo_rev = [i for i, p in enumerate(p_rev) if p != "dummy"]
-            if todo_rev:
-                def _gen_rev(chunk):
-                    return generate_full_output(mdl, tok, chunk, 
-                        max_len=CONFIG["max_length"]["reviewer"], max_new=CONFIG["max_new_tokens"]["reviewer"],
-                        do_sample=CONFIG["sampling"]["reviewer"]["do_sample"], temperature=CONFIG["sampling"]["reviewer"]["temperature"], device=dev)
-                raw_outs = batched_generate_with_fallback_local(_gen_rev, [p_rev[i] for i in todo_rev], bs, desc="Review B->A")
-                for idx, raw in zip(todo_rev, raw_outs):
-                    parsed = parse_reviewer_json_robust(raw)
-                    df.at[idx, "raw_review_B_on_A"] = raw
-                    df.at[idx, "review_score_B_on_A"] = parsed["score"]
-                    df.at[idx, "review_feedback_B_on_A"] = parsed["feedback"]
+        # 2. Review B->A
+        p_rev = []
+        for i, r in df.iterrows():
+            if df.iloc[i]["review_feedback_B_on_A"]:
+                p_rev.append("dummy")
+            else:
+                opts = r["options"] if isinstance(r["options"], dict) else {}
+                formatted_opts = format_options(opts)
+                p_rev.append(safe_format(reviewer_tmpl, question=target_questions[i], options=formatted_opts, 
+                                        reasoning=r["reasoning_A"], answer=r["answer_A"]))
+        
+        todo_rev = [i for i, p in enumerate(p_rev) if p != "dummy"]
+        if todo_rev:
+            def _gen_rev(chunk):
+                return generate_full_output(mdl, tok, chunk, 
+                    max_len=CONFIG["max_length"]["reviewer"], max_new=CONFIG["max_new_tokens"]["reviewer"],
+                    do_sample=CONFIG["sampling"]["reviewer"]["do_sample"], 
+                    temperature=CONFIG["sampling"]["reviewer"]["temperature"], device=dev)
+            raw_outs = batched_generate_with_fallback_local(_gen_rev, [p_rev[i] for i in todo_rev], bs, desc="Review B->A")
+            for idx, raw in zip(todo_rev, raw_outs):
+                parsed = parse_reviewer_json_robust(raw)
+                df.at[idx, "raw_review_B_on_A"] = raw
+                df.at[idx, "review_score_B_on_A"] = parsed["score"]
+                df.at[idx, "review_feedback_B_on_A"] = parsed["feedback"]
 
-            df.to_json(stage1_path, orient="records", lines=True, force_ascii=False)
-            elapsed = time.time() - file_start
-            tqdm.write(f"  >>> Done. ⏱ Time: {str(timedelta(seconds=int(elapsed)))}")
-
+        df.to_json(stage1_path, orient="records", lines=True, force_ascii=False)
+        elapsed = time.time() - file_start
+        print(f"  >>> Done. ⏱ Time: {str(timedelta(seconds=int(elapsed)))}")
+        
         del mdl, tok
         force_clean_gpu()
-
-    # =========================================================================
-    # Phase 3: Reasoner A Reload (Review A->B)
-    # =========================================================================
-    print(f"\n{'='*60}\n[Phase 3/3] Check & Run: Reasoner A (Review)\n{'='*60}")
     
-    todo_files_a_rev = []
-    for fp in files:
-        noise, level, seed_tag = parse_path_info(fp)
-        stage1_path = RESULTS_ROOT / noise / level / seed_tag / "stage1_results.jsonl"
-        if not stage1_path.exists(): continue
+    # =========================================================================
+    # Phase 3: Review A->B
+    # =========================================================================
+    print(f"\n[Phase 3/3] {noise}/{level}/{seed_tag} - Review A->B")
+    
+    need_phase3 = True
+    if stage1_path.exists():
         try:
             df = pd.read_json(stage1_path, lines=True)
-            if "review_feedback_A_on_B" not in df.columns or not df["review_feedback_A_on_B"].astype(str).str.strip().all():
-                todo_files_a_rev.append(fp)
-        except: pass
-
-    if not todo_files_a_rev:
-        print("[Skip] All files already have Review A->B.")
-    else:
+            if "review_feedback_A_on_B" in df.columns and df["review_feedback_A_on_B"].astype(str).str.strip().all():
+                need_phase3 = False
+                print("  [Skip] Review A->B already exists")
+        except:
+            pass
+    
+    if need_phase3:
         tok, mdl, dev = load_model_auto(CONFIG['models']['reasoner_A'], quant4bit=CONFIG['quant_4bit']['reasoner_A'])
         
-        for input_path in tqdm(todo_files_a_rev, desc="[Phase 3] Files"):
-            file_start = time.time()
-            noise, level, seed_tag = parse_path_info(input_path)
-            stage1_path = RESULTS_ROOT / noise / level / seed_tag / "stage1_results.jsonl"
-            df = pd.read_json(stage1_path, lines=True)
-            tqdm.write(f"  [Run] {noise}/{level}/{seed_tag} Review A->B...")
+        file_start = time.time()
+        df = pd.read_json(stage1_path, lines=True)
 
-            for c in ["review_score_A_on_B", "review_feedback_A_on_B", "raw_review_A_on_B"]:
-                if c not in df.columns: df[c] = ""
-            target_questions = [r.get("noisy_question") if r.get("noisy_question") else r["question"] for _, r in df.iterrows()]
-            
-            p_rev = []
-            for i, r in df.iterrows():
-                if df.iloc[i]["review_feedback_A_on_B"]: p_rev.append("dummy")
-                else:
-                    opts = r["options"] if isinstance(r["options"], dict) else {}
-                    formatted_opts = format_options(opts)
-                    p_rev.append(safe_format(reviewer_tmpl, question=target_questions[i], options=formatted_opts, reasoning=r["reasoning_B"], answer=r["answer_B"]))
-            
-            todo_rev = [i for i, p in enumerate(p_rev) if p != "dummy"]
-            if todo_rev:
-                def _gen_rev(chunk):
-                    return generate_full_output(mdl, tok, chunk, 
-                        max_len=CONFIG["max_length"]["reviewer"], max_new=CONFIG["max_new_tokens"]["reviewer"],
-                        do_sample=CONFIG["sampling"]["reviewer"]["do_sample"], temperature=CONFIG["sampling"]["reviewer"]["temperature"], device=dev)
-                raw_outs = batched_generate_with_fallback_local(_gen_rev, [p_rev[i] for i in todo_rev], bs, desc="Review A->B")
-                for idx, raw in zip(todo_rev, raw_outs):
-                    parsed = parse_reviewer_json_robust(raw)
-                    df.at[idx, "raw_review_A_on_B"] = raw
-                    df.at[idx, "review_score_A_on_B"] = parsed["score"]
-                    df.at[idx, "review_feedback_A_on_B"] = parsed["feedback"]
+        for c in ["review_score_A_on_B", "review_feedback_A_on_B", "raw_review_A_on_B"]:
+            if c not in df.columns:
+                df[c] = ""
+        
+        target_questions = [r.get("noisy_question") if r.get("noisy_question") else r["question"] for _, r in df.iterrows()]
+        
+        p_rev = []
+        for i, r in df.iterrows():
+            if df.iloc[i]["review_feedback_A_on_B"]:
+                p_rev.append("dummy")
+            else:
+                opts = r["options"] if isinstance(r["options"], dict) else {}
+                formatted_opts = format_options(opts)
+                p_rev.append(safe_format(reviewer_tmpl, question=target_questions[i], options=formatted_opts, 
+                                        reasoning=r["reasoning_B"], answer=r["answer_B"]))
+        
+        todo_rev = [i for i, p in enumerate(p_rev) if p != "dummy"]
+        if todo_rev:
+            def _gen_rev(chunk):
+                return generate_full_output(mdl, tok, chunk, 
+                    max_len=CONFIG["max_length"]["reviewer"], max_new=CONFIG["max_new_tokens"]["reviewer"],
+                    do_sample=CONFIG["sampling"]["reviewer"]["do_sample"], 
+                    temperature=CONFIG["sampling"]["reviewer"]["temperature"], device=dev)
+            raw_outs = batched_generate_with_fallback_local(_gen_rev, [p_rev[i] for i in todo_rev], bs, desc="Review A->B")
+            for idx, raw in zip(todo_rev, raw_outs):
+                parsed = parse_reviewer_json_robust(raw)
+                df.at[idx, "raw_review_A_on_B"] = raw
+                df.at[idx, "review_score_A_on_B"] = parsed["score"]
+                df.at[idx, "review_feedback_A_on_B"] = parsed["feedback"]
 
-            df.to_json(stage1_path, orient="records", lines=True, force_ascii=False)
-            elapsed = time.time() - file_start
-            tqdm.write(f"  >>> Done. ⏱ Time: {str(timedelta(seconds=int(elapsed)))}")
-
+        df.to_json(stage1_path, orient="records", lines=True, force_ascii=False)
+        elapsed = time.time() - file_start
+        print(f"  >>> Done. ⏱ Time: {str(timedelta(seconds=int(elapsed)))}")
+        
         del mdl, tok
         force_clean_gpu()
 
 
 # =========================================================
-# STAGE 2: Adjudicator Utils (Fixed Logic)
+# STAGE 1: 파일별 + Seed별 처리
 # =========================================================
+def run_stage1_model_centric(files: List[str], prompts: dict):
+    print(f"\n{'='*60}\n[STAGE 1] Multi-Agent Reasoning with 5 Seeds for Clean\n{'='*60}")
+    
+    for input_path in tqdm(files, desc="Files"):
+        noise, level, seed_orig = parse_path_info(input_path)
+        
+        # ✅ Clean 데이터면 5개 seed로 반복
+        if noise == "clean":
+            seed_list = [(f"seed_{i}", s) for i, s in enumerate(CONFIG["clean_seeds"])]
+        else:
+            # 노이즈 데이터는 1번만
+            seed_list = [(seed_orig, CONFIG["default_seed"])]
+        
+        for seed_tag, actual_seed in seed_list:
+            run_stage1_single_file_seed(
+                input_path=input_path,
+                noise=noise,
+                level=level,
+                seed_tag=seed_tag,
+                actual_seed=actual_seed,
+                prompts=prompts,
+            )
 
+
+# =========================================================
+# STAGE 2: Adjudicator Utils
+# =========================================================
 class AllowOnly(LogitsProcessor):
     def __init__(self, ids): self.ids = set(ids)
     def __call__(self, input_ids, scores):
@@ -613,7 +636,7 @@ def forced_label_generate(model, tokenizer, prompts, *, max_length, max_new_toke
     pad_id = tokenizer.eos_token_id or tokenizer.pad_token_id or 0
     
     gen_kwargs = dict(
-        max_new_tokens=1,  # 딱 1글자만 생성
+        max_new_tokens=1,
         min_new_tokens=1,
         do_sample=False,
         pad_token_id=pad_id,
@@ -629,15 +652,12 @@ def forced_label_generate(model, tokenizer, prompts, *, max_length, max_new_toke
     for i in range(out.size(0)):
         gen = out[i, ilen:]
         txt = tokenizer.decode(gen, skip_special_tokens=True)
-        # 생성된 글자에서 알파벳 추출
         lab = (txt.strip().replace('"', "").replace("'", "")[:1] or "?").upper()
         
-        # 안전장치: 혹시라도 엉뚱한게 나오면 매칭 시도
         if lab not in {"A","B","C","D"}:
             m = re.search(r'[ABCD]', txt.upper())
             lab = m.group(0) if m else "?"
             
-        # 결과 저장 포맷
         raws.append(f'{{"label":"{lab}"}}')
         labels.append(lab)
         
@@ -653,56 +673,56 @@ OUTPUT_COLS = [
 ]
 
 def run_stage2_all(files: List[str], prompts: dict):
-    # 시작 로그 (요청된 스타일)
     print("Loading model...")
     
-    # 1) 대상 파일 선별
-    todo_files = []
+    # 1) 대상 결정
+    todo_tasks = []
     for fp in files:
-        noise, level, seed_tag = parse_path_info(fp)
-        final_csv = RESULTS_ROOT / noise / level / seed_tag / "stage2_results.csv" # output naming matched to user req
-        stage1_path = RESULTS_ROOT / noise / level / seed_tag / "stage1_results.jsonl"
+        noise, level, seed_orig = parse_path_info(fp)
         
-        # 파일 존재하고, 아직 결과가 없으면 처리
-        if stage1_path.exists() and not final_csv.exists():
-            todo_files.append((stage1_path, final_csv))
+        # Clean이면 5개 seed 모두 처리
+        if noise == "clean":
+            seed_list = [f"seed_{i}" for i in range(len(CONFIG["clean_seeds"]))]
+        else:
+            seed_list = [seed_orig]
+        
+        for seed_tag in seed_list:
+            stage1_path = RESULTS_ROOT / noise / level / seed_tag / "stage1_results.jsonl"
+            final_csv = RESULTS_ROOT / noise / level / seed_tag / "stage2_results.csv"
+            
+            if stage1_path.exists() and not final_csv.exists():
+                todo_tasks.append((stage1_path, final_csv))
     
-    if not todo_files:
+    if not todo_tasks:
         print("Nothing to adjudicate.")
         return
 
     # 2) 모델 로드
     tok, mdl, dev = load_model_auto(CONFIG["models"]["adjudicator"], quant4bit=False)
-    
-    # 프롬프트 템플릿 (파일에서 읽은 것 사용)
     prompt_tmpl = prompts["adjudicator"]
-    bs = 8 # User requested batch_size=8
+    bs = 8
     
     print("Models and prompt loaded.")
 
-    # 3) 파일 루프
-    for in_path, out_path_base in todo_files:
+    # 3) 처리
+    for in_path, out_path_base in todo_tasks:
         if not in_path.exists():
             print(f"Processing file: {in_path}")
             print(f"[Error] Input not found: {in_path}")
             continue
             
-        # 파일 처리 시작 로그
         print(f"Processing file: {in_path}")
         
-        # 데이터 로드
         df = pd.read_json(in_path, lines=True)
-        # 필요한 컬럼 채우기
         for c in OUTPUT_COLS[:-2]:
              if c not in df.columns:
                  df[c] = "" if "score_" not in c else 0
 
-        # 프롬프트 준비
         prompts_list = [
             safe_format_prompt(
                 prompt_tmpl,
                 question=r.get("noisy_question") or r.get("question", ""),
-                options=format_options(r.get("options", "")), # 포맷팅 적용
+                options=format_options(r.get("options", "")),
                 reasoning_model1=r.get("reasoning_A", ""),
                 answer_model1=r.get("answer_A", "?"),
                 reasoning_model2=r.get("reasoning_B", ""),
@@ -715,9 +735,7 @@ def run_stage2_all(files: List[str], prompts: dict):
             for _, r in df.iterrows()
         ]
 
-        # =========================
-        # PROMPT TOKEN LENGTH CHECK
-        # =========================
+        # Token stats
         try:
             sample_n = min(200, len(prompts_list))
             lens = []
@@ -732,29 +750,29 @@ def run_stage2_all(files: List[str], prompts: dict):
             mx = max(lens) if lens else 0
             avg = sum(lens) / len(lens) if lens else 0
 
-            print(f"[Prompt Token Stats] samples={sample_n} avg={avg:.1f} p95={p95} p99={p99} max={mx} (max_length={CONFIG['max_length']['adjudicator']})")
+            print(f"[Prompt Token Stats] samples={sample_n} avg={avg:.1f} p95={p95} p99={p99} max={mx}")
 
             if mx >= CONFIG["max_length"]["adjudicator"]:
-                print(f"[Warning] max prompt tokens ({mx}) >= max_length ({CONFIG['max_length']['adjudicator']}). Truncation likely happening.")
+                print(f"[Warning] max prompt tokens ({mx}) >= max_length ({CONFIG['max_length']['adjudicator']})")
             elif p95 >= int(CONFIG["max_length"]["adjudicator"] * 0.9):
-                print(f"[Warning] p95 ({p95}) is close to max_length ({CONFIG['max_length']['adjudicator']}). Consider increasing max_length.")
+                print(f"[Warning] p95 ({p95}) close to max_length ({CONFIG['max_length']['adjudicator']})")
         except Exception as e:
-            print(f"[Prompt Token Stats] skipped due to error: {e}")
+            print(f"[Prompt Token Stats] skipped: {e}")
 
-        # 배치 생성 (진행바)
+        # 배치 생성
         all_labels, all_raw = [], []
         for i in tqdm(range(0, len(prompts_list), bs), desc=f"Processing {in_path.name}"):
             batch = prompts_list[i:i+bs]
             labels, raws = forced_label_generate(
                 mdl, tok, batch,
                 max_length=CONFIG["max_length"]["adjudicator"],
-                max_new_tokens=CONFIG["max_new_tokens"]["adjudicator"], # 1
+                max_new_tokens=CONFIG["max_new_tokens"]["adjudicator"],
                 first_device=dev
             )
             all_labels.extend(labels)
             all_raw.extend(raws)
 
-        # 결과 저장 (정확히 OUTPUT_COLS만)
+        # 결과 저장
         out_df = pd.DataFrame(index=df.index)
         for c in OUTPUT_COLS:
             if c in df.columns:
@@ -764,14 +782,10 @@ def run_stage2_all(files: List[str], prompts: dict):
         out_df["final_answer"] = [str(x).upper() for x in all_labels]
         out_df["mediator_raw"] = all_raw
         
-        # 경로 처리
         csv_path = out_path_base.with_suffix(".csv")
         jsonl_path = out_path_base.with_suffix(".jsonl")
         
-        # 1) CSV 저장
         out_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-
-        # 2) JSONL 저장
         out_df.to_json(jsonl_path, orient="records", lines=True, force_ascii=False)
 
         print(f"[Saved] {csv_path}")
@@ -795,17 +809,11 @@ def main():
         "adjudicator": read_text(PROMPT_DIR / "final_medical_adjudicator.txt"),
     }
     
-    # [설정] 파일 리스트
-    files = sorted(
-        glob.glob(str(BASE_DIR / "data/processed/medqa/mlm/**/*.jsonl"), recursive=True))    
-    # 테스트용 단일 파일
-    #files = ["/home/hslee/multiagent/data/raw/medqa/medqa_all_clean.jsonl"]
-    
+    files = sorted(glob.glob(str(BASE_DIR / "data/processed/medqa/mlm/**/*.jsonl"), recursive=True))
     print(f"[Files] {len(files)} target files.")
 
     if CONFIG["run"]["stage"] in {"1", "all"}:
         run_stage1_model_centric(files, prompts)
-        # force_clean_gpu() 제거 (함수 내부에서 이미 수행함)
 
     if CONFIG["run"]["stage"] in {"2", "all"}:
         run_stage2_all(files, prompts)
