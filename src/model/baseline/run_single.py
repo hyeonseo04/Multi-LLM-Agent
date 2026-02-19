@@ -44,8 +44,10 @@ CONFIG = {
     # 재시도(원하면 0으로 둬도 됨)
     "max_retries": 1,
 
-    # seed
-    "seed": 42,
+    # ✅ Clean 데이터용 5개 random seed
+    "clean_seeds": [42, 123, 456, 789, 1024],
+    # 노이즈 데이터용 기본 seed
+    "default_seed": 42,
 }
 
 _VALID = {"A", "B", "C", "D"}
@@ -238,18 +240,110 @@ def generate_all_summaries(results_root: str):
 
 
 # =========================================================
-# 5) Main
+# 5) 단일 실험 실행 함수
+# =========================================================
+def run_single_experiment(
+    model,
+    tokenizer,
+    prompt_templ: str,
+    p_path: str,
+    noise: str,
+    level: str,
+    seed_name: str,
+    actual_seed: int,
+    results_root: Path,
+):
+    """
+    단일 실험 실행 (clean이든 noisy든 동일한 로직)
+    """
+    out_dir = results_root / noise / level / seed_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # skip if already done
+    if (out_dir / "metrics.json").exists():
+        tqdm.write(f"[SKIP] Exists: {noise}/{level}/{seed_name}")
+        return
+
+    tqdm.write(f"[RUN] {noise} | {level} | {seed_name} (random_seed={actual_seed})")
+
+    # 재현성 설정
+    torch.manual_seed(actual_seed)
+    torch.cuda.manual_seed_all(actual_seed)
+
+    df = pd.read_json(p_path, lines=True)
+
+    # 텍스트 필드 결정
+    text_field = "noisy_question" if "noisy_question" in df.columns else "question"
+    if "options" not in df.columns or "answer" not in df.columns:
+        tqdm.write(f"[WARN] Missing columns in {p_path}, skip")
+        return
+
+    texts = [build_text_block(row[text_field], row["options"]) for _, row in df.iterrows()]
+    prompts = [safe_format_prompt(prompt_templ, t) for t in texts]
+    true_ans = df["answer"].astype(str).str.upper().str.strip().tolist()
+
+    n = len(df)
+    preds = ["?"] * n
+
+    # retries 구조는 유지
+    idxs = list(range(n))
+    for attempt in range(CONFIG["max_retries"] + 1):
+        if not idxs:
+            break
+        for s in tqdm(range(0, len(idxs), CONFIG["batch_size"]), desc=f"Attempt {attempt+1}", leave=False):
+            b = idxs[s:s + CONFIG["batch_size"]]
+            batch_prompts = [prompts[i] for i in b]
+            batch_preds = classify_forced_one_token(model, tokenizer, batch_prompts, CONFIG["max_length"])
+            for k, i0 in enumerate(b):
+                if batch_preds[k] in _VALID:
+                    preds[i0] = batch_preds[k]
+        idxs = [i for i in idxs if preds[i] == "?"]
+
+    out_df = pd.DataFrame({
+        "pred": preds,
+        "true": true_ans,
+        "correct": [int(p == t) for p, t in zip(preds, true_ans)],
+        "used_question": df[text_field].astype(str).tolist(),
+    })
+    out_df.to_csv(out_dir / "predictions.csv", index=False)
+
+    parsed = sum(p in _VALID for p in preds)
+    acc = float(out_df["correct"].mean())
+
+    metrics = {
+        "noise": noise,
+        "level": level,
+        "seed": seed_name,
+        "actual_random_seed": actual_seed,
+        "accuracy": acc,
+        "num_samples": int(n),
+        "parsed": int(parsed),
+        "timestamp": datetime.now().isoformat(),
+        "model_id": CONFIG["model_id"],
+        "prompt_file": CONFIG["prompt_file"],
+        "batch_size": CONFIG["batch_size"],
+        "max_length": CONFIG["max_length"],
+        "decode": "forced_generate_1_token_allowed_{A,B,C,D}",
+        "input_path": str(p_path),
+        "text_field_used": text_field,
+    }
+    (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+
+    # cleanup
+    del df, out_df, texts, prompts
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+# =========================================================
+# 6) Main
 # =========================================================
 def main():
     assert torch.cuda.is_available(), "CUDA GPU not detected"
     n_gpus = torch.cuda.device_count()
     print(f"[Info] GPUs: {n_gpus} | model: {CONFIG['model_id']}")
 
-    # 재현성
-    torch.manual_seed(CONFIG["seed"])
-    torch.cuda.manual_seed_all(CONFIG["seed"])
-
-    # tokenizer/model
+    # tokenizer/model (seed 적용 전에 로드)
     tok = AutoTokenizer.from_pretrained(CONFIG["model_id"], trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -272,79 +366,27 @@ def main():
     results_root.mkdir(parents=True, exist_ok=True)
 
     for p_path in tqdm(input_paths, desc="🚀 Overall Experiments"):
-        noise, level, seed = parse_experiment_id(p_path)
-        out_dir = results_root / noise / level / seed
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        # skip if already done
-        if (out_dir / "metrics.json").exists():
-            tqdm.write(f"[SKIP] Exists: {noise}/{level}/{seed}")
-            continue
-
-        tqdm.write(f"[RUN] {noise} | {level} | {seed}")
-
-        df = pd.read_json(p_path, lines=True)
-
-        # 텍스트 필드 결정
-        text_field = "noisy_question" if "noisy_question" in df.columns else "question"
-        if "options" not in df.columns or "answer" not in df.columns:
-            tqdm.write(f"[WARN] Missing columns in {p_path}, skip")
-            continue
-
-        texts = [build_text_block(row[text_field], row["options"]) for _, row in df.iterrows()]
-        prompts = [safe_format_prompt(prompt_templ, t) for t in texts]
-        true_ans = df["answer"].astype(str).str.upper().str.strip().tolist()
-
-        n = len(df)
-        preds = ["?"] * n
-
-        # retries 구조는 유지 (원하면 0으로 줄여도 됨)
-        idxs = list(range(n))
-        for attempt in range(CONFIG["max_retries"] + 1):
-            if not idxs:
-                break
-            for s in tqdm(range(0, len(idxs), CONFIG["batch_size"]), desc=f"Attempt {attempt+1}", leave=False):
-                b = idxs[s:s + CONFIG["batch_size"]]
-                batch_prompts = [prompts[i] for i in b]
-                batch_preds = classify_forced_one_token(model, tok, batch_prompts, CONFIG["max_length"])
-                for k, i0 in enumerate(b):
-                    if batch_preds[k] in _VALID:
-                        preds[i0] = batch_preds[k]
-            idxs = [i for i in idxs if preds[i] == "?"]
-
-        out_df = pd.DataFrame({
-            "pred": preds,
-            "true": true_ans,
-            "correct": [int(p == t) for p, t in zip(preds, true_ans)],
-            "used_question": df[text_field].astype(str).tolist(),
-        })
-        out_df.to_csv(out_dir / "predictions.csv", index=False)
-
-        parsed = sum(p in _VALID for p in preds)
-        acc = float(out_df["correct"].mean())  # parsed==n이면 그대로
-
-        metrics = {
-            "noise": noise,
-            "level": level,
-            "seed": seed,
-            "accuracy": acc,
-            "num_samples": int(n),
-            "parsed": int(parsed),
-            "timestamp": datetime.now().isoformat(),
-            "model_id": CONFIG["model_id"],
-            "prompt_file": CONFIG["prompt_file"],
-            "batch_size": CONFIG["batch_size"],
-            "max_length": CONFIG["max_length"],
-            "decode": "forced_generate_1_token_allowed_{A,B,C,D}",
-            "input_path": str(p_path),
-            "text_field_used": text_field,
-        }
-        (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-
-        # cleanup
-        del df, out_df, texts, prompts
-        gc.collect()
-        torch.cuda.empty_cache()
+        noise, level, seed_orig = parse_experiment_id(p_path)
+        
+        # ✅ Clean 데이터면 5개 seed로 반복 실행
+        if noise == "clean":
+            seed_list = [(f"seed_{i}", s) for i, s in enumerate(CONFIG["clean_seeds"])]
+        else:
+            # 노이즈 데이터는 원래대로 1번만 (파일명의 seed 사용)
+            seed_list = [(seed_orig, CONFIG["default_seed"])]
+        
+        for seed_name, actual_seed in seed_list:
+            run_single_experiment(
+                model=model,
+                tokenizer=tok,
+                prompt_templ=prompt_templ,
+                p_path=p_path,
+                noise=noise,
+                level=level,
+                seed_name=seed_name,
+                actual_seed=actual_seed,
+                results_root=results_root,
+            )
 
     # summaries
     generate_all_summaries(str(results_root))
