@@ -10,8 +10,8 @@ run_multiagent_model_centric.py
    * Stage 2: Forced Decoding (A/B/C/D), Token Stats, CSV+JSONL Output
    
 타임아웃 시   
-export HF_HUB_HTTP_TIMEOUT=60
-export HF_HUB_ETAG_TIMEOUT=60
+export HF_HUB_HTTP_TIMEOUT=300
+export HF_HUB_ETAG_TIMEOUT=300
 """
 
 import os, re, gc, json, glob, time
@@ -797,7 +797,7 @@ def main():
     
     # [설정] 파일 리스트
     files = sorted(
-        glob.glob(str(BASE_DIR / "data/processed/medqa/duplication/**/*.jsonl"), recursive=True))    
+        glob.glob(str(BASE_DIR / "data/processed/medqa/mlm/**/*.jsonl"), recursive=True))    
     # 테스트용 단일 파일
     #files = ["/home/hslee/multiagent/data/raw/medqa/medqa_all_clean.jsonl"]
     
