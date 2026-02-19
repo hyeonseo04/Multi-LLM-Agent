@@ -43,8 +43,10 @@ CONFIG = {
     # 재시도
     "max_retries": 1,
     
-    # seed
-    "seed": 42,
+    # ✅ Clean 데이터용 5개 random seed
+    "clean_seeds": [42, 123, 456, 789, 1024],
+    # 노이즈 데이터용 기본 seed
+    "default_seed": 42,
     
     # ========================================
     # ⚡ 성능 최적화
@@ -360,7 +362,198 @@ def generate_all_summaries(results_root: str):
 
 
 # =========================================================
-# 5) Main
+# 5) 단일 실험 실행 함수
+# =========================================================
+def run_single_experiment(
+    model,
+    tokenizer,
+    prompt_templ: str,
+    p_path: str,
+    noise: str,
+    level: str,
+    seed_name: str,
+    actual_seed: int,
+    results_root: Path,
+    current_global_batch_size: int,
+) -> int:
+    """
+    단일 실험 실행 (clean이든 noisy든 동일한 로직)
+    Returns: 업데이트된 global batch_size
+    """
+    out_dir = results_root / noise / level / seed_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Skip if already done
+    if (out_dir / "metrics.json").exists():
+        tqdm.write(f"[SKIP] {noise}/{level}/{seed_name}")
+        return current_global_batch_size
+
+    tqdm.write(f"\n[RUN] {noise} | {level} | {seed_name} (random_seed={actual_seed})")
+    tqdm.write(f"[Batch] Starting with size: {current_global_batch_size}")
+
+    # 재현성 설정
+    torch.manual_seed(actual_seed)
+    torch.cuda.manual_seed_all(actual_seed)
+
+    df = pd.read_json(p_path, lines=True)
+    text_field = "noisy_question" if "noisy_question" in df.columns else "question"
+    
+    if "options" not in df.columns or "answer" not in df.columns:
+        tqdm.write(f"[WARN] Missing columns, skip")
+        return current_global_batch_size
+
+    texts = [build_text_block(row[text_field], row["options"]) for _, row in df.iterrows()]
+    prompts = [safe_format_prompt(prompt_templ, t) for t in texts]
+    true_ans = df["answer"].astype(str).str.upper().str.strip().tolist()
+    
+    n = len(df)
+    preds = ["?"] * n
+    full_responses = [""] * n
+    
+    idxs = list(range(n))
+    
+    # OOM 카운터
+    oom_consecutive_count = 0
+    
+    for attempt in range(CONFIG["max_retries"] + 1):
+        if not idxs:
+            break
+        
+        # 현재 시도의 batch_size
+        attempt_batch_size = current_global_batch_size
+        
+        s = 0
+        while s < len(idxs):
+            # 남은 샘플 수
+            remaining = len(idxs) - s
+            current_batch_size = min(attempt_batch_size, remaining)
+            
+            b = idxs[s:s + current_batch_size]
+            batch_prompts = [prompts[i] for i in b]
+            
+            try:
+                # 배치 처리 (자동 축소 포함)
+                if CONFIG["auto_reduce_batch_size"]:
+                    batch_preds, batch_responses = classify_cot_with_auto_batch(
+                        model, tokenizer, batch_prompts,
+                        CONFIG["max_length"], CONFIG["cot_max_new_tokens"],
+                        initial_batch_size=current_batch_size
+                    )
+                else:
+                    batch_preds, batch_responses = classify_cot_generation(
+                        model, tokenizer, batch_prompts,
+                        CONFIG["max_length"], CONFIG["cot_max_new_tokens"]
+                    )
+                
+                # 성공
+                for k, i0 in enumerate(b):
+                    if batch_preds[k] in _VALID:
+                        preds[i0] = batch_preds[k]
+                        full_responses[i0] = batch_responses[k]
+                
+                s += current_batch_size
+                oom_consecutive_count = 0  # 리셋
+                
+            except torch.cuda.OutOfMemoryError:
+                oom_consecutive_count += 1
+                
+                tqdm.write(f"[OOM] Batch size {current_batch_size} failed")
+                tqdm.write(f"[OOM] Consecutive count: {oom_consecutive_count}")
+                
+                # 연속 OOM → 전역 감소
+                if oom_consecutive_count >= CONFIG["oom_threshold"]:
+                    old_global = current_global_batch_size
+                    current_global_batch_size = max(CONFIG["min_batch_size"], current_global_batch_size // 2)
+                    attempt_batch_size = current_global_batch_size
+                    
+                    tqdm.write(f"[OOM] Global batch_size: {old_global} → {current_global_batch_size}")
+                    oom_consecutive_count = 0
+                
+                # 현재 배치만 축소해서 재시도
+                retry_size = max(CONFIG["min_batch_size"], current_batch_size // 2)
+                tqdm.write(f"[Retry] With batch_size: {retry_size}")
+                
+                torch.cuda.empty_cache()
+                gc.collect()
+                
+                # 재시도
+                try:
+                    batch_preds, batch_responses = classify_cot_with_auto_batch(
+                        model, tokenizer, batch_prompts,
+                        CONFIG["max_length"], CONFIG["cot_max_new_tokens"],
+                        initial_batch_size=retry_size
+                    )
+                    
+                    for k, i0 in enumerate(b):
+                        if batch_preds[k] in _VALID:
+                            preds[i0] = batch_preds[k]
+                            full_responses[i0] = batch_responses[k]
+                    
+                    s += current_batch_size
+                    
+                except Exception as e:
+                    tqdm.write(f"[ERROR] Retry failed: {e}")
+                    s += current_batch_size  # 건너뛰기
+        
+        idxs = [i for i in idxs if preds[i] == "?"]
+    
+    # 결과 저장
+    out_df = pd.DataFrame({
+        "pred": preds,
+        "true": true_ans,
+        "correct": [int(p == t) for p, t in zip(preds, true_ans)],
+        "used_question": df[text_field].astype(str).tolist(),
+        "reasoning": full_responses,
+    })
+    out_df.to_csv(out_dir / "predictions.csv", index=False)
+    
+    parsed = sum(p in _VALID for p in preds)
+    acc = float(out_df["correct"].mean())
+    
+    tqdm.write(f"[Result] Accuracy: {acc:.4f} ({int(acc*n)}/{n})")
+    tqdm.write(f"[Result] Parsed: {parsed}/{n}")
+    
+    # Metrics 저장
+    metrics = {
+        "method": "cot",
+        "noise": noise,
+        "level": level,
+        "seed": seed_name,
+        "actual_random_seed": actual_seed,
+        "accuracy": acc,
+        "num_samples": n,
+        "parsed": parsed,
+        "timestamp": datetime.now().isoformat(),
+        "model_id": CONFIG["model_id"],
+        "prompt_file": CONFIG["prompt_file"],
+        "initial_batch_size": CONFIG["initial_batch_size"],
+        "final_batch_size": current_global_batch_size,
+        "max_length": CONFIG["max_length"],
+        "cot_max_new_tokens": CONFIG["cot_max_new_tokens"],
+        "decode_method": "free_generation",
+        "optimizations": {
+            "flash_attention": CONFIG.get("use_flash_attention", False),
+            "torch_compile": CONFIG.get("use_torch_compile", False),
+            "auto_batch_reduce": CONFIG.get("auto_reduce_batch_size", False),
+        },
+        "input_path": str(p_path),
+        "text_field_used": text_field,
+    }
+    
+    (out_dir / "metrics.json").write_text(
+        json.dumps(metrics, indent=2), encoding="utf-8"
+    )
+
+    # Cleanup
+    del df, out_df, texts, prompts
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    return current_global_batch_size
+
+
+# =========================================================
+# 6) Main
 # =========================================================
 def main():
     assert torch.cuda.is_available(), "CUDA GPU not detected"
@@ -370,10 +563,6 @@ def main():
     print("⚡ CoT Experiments with Full Optimization")
     print("="*60)
     print(f"GPUs: {n_gpus} | Model: {CONFIG['model_id']}")
-    
-    # 재현성
-    torch.manual_seed(CONFIG["seed"])
-    torch.cuda.manual_seed_all(CONFIG["seed"])
 
     # Tokenizer
     tok = AutoTokenizer.from_pretrained(CONFIG["model_id"], trust_remote_code=True)
@@ -444,170 +633,30 @@ def main():
 
     # 전역 batch_size (적응형)
     current_global_batch_size = initial_batch_size
-    oom_consecutive_count = 0
 
     for p_path in tqdm(input_paths, desc="🚀 CoT Experiments"):
-        noise, level, seed = parse_experiment_id(p_path)
-        out_dir = results_root / noise / level / seed
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        # Skip if already done
-        if (out_dir / "metrics.json").exists():
-            tqdm.write(f"[SKIP] {noise}/{level}/{seed}")
-            continue
-
-        tqdm.write(f"\n[RUN] {noise} | {level} | {seed}")
-        tqdm.write(f"[Batch] Starting with size: {current_global_batch_size}")
-
-        df = pd.read_json(p_path, lines=True)
-        text_field = "noisy_question" if "noisy_question" in df.columns else "question"
+        noise, level, seed_orig = parse_experiment_id(p_path)
         
-        if "options" not in df.columns or "answer" not in df.columns:
-            tqdm.write(f"[WARN] Missing columns, skip")
-            continue
-
-        texts = [build_text_block(row[text_field], row["options"]) for _, row in df.iterrows()]
-        prompts = [safe_format_prompt(prompt_templ, t) for t in texts]
-        true_ans = df["answer"].astype(str).str.upper().str.strip().tolist()
+        # ✅ Clean 데이터면 5개 seed로 반복 실행
+        if noise == "clean":
+            seed_list = [(f"seed_{i}", s) for i, s in enumerate(CONFIG["clean_seeds"])]
+        else:
+            # 노이즈 데이터는 원래대로 1번만
+            seed_list = [(seed_orig, CONFIG["default_seed"])]
         
-        n = len(df)
-        preds = ["?"] * n
-        full_responses = [""] * n
-        
-        idxs = list(range(n))
-        
-        for attempt in range(CONFIG["max_retries"] + 1):
-            if not idxs:
-                break
-            
-            # 현재 시도의 batch_size
-            attempt_batch_size = current_global_batch_size
-            
-            s = 0
-            while s < len(idxs):
-                # 남은 샘플 수
-                remaining = len(idxs) - s
-                current_batch_size = min(attempt_batch_size, remaining)
-                
-                b = idxs[s:s + current_batch_size]
-                batch_prompts = [prompts[i] for i in b]
-                
-                try:
-                    # 배치 처리 (자동 축소 포함)
-                    if auto_reduce:
-                        batch_preds, batch_responses = classify_cot_with_auto_batch(
-                            model, tok, batch_prompts,
-                            CONFIG["max_length"], CONFIG["cot_max_new_tokens"],
-                            initial_batch_size=current_batch_size
-                        )
-                    else:
-                        batch_preds, batch_responses = classify_cot_generation(
-                            model, tok, batch_prompts,
-                            CONFIG["max_length"], CONFIG["cot_max_new_tokens"]
-                        )
-                    
-                    # 성공
-                    for k, i0 in enumerate(b):
-                        if batch_preds[k] in _VALID:
-                            preds[i0] = batch_preds[k]
-                            full_responses[i0] = batch_responses[k]
-                    
-                    s += current_batch_size
-                    oom_consecutive_count = 0  # 리셋
-                    
-                except torch.cuda.OutOfMemoryError:
-                    oom_consecutive_count += 1
-                    
-                    tqdm.write(f"[OOM] Batch size {current_batch_size} failed")
-                    tqdm.write(f"[OOM] Consecutive count: {oom_consecutive_count}")
-                    
-                    # 연속 OOM → 전역 감소
-                    if oom_consecutive_count >= CONFIG["oom_threshold"]:
-                        old_global = current_global_batch_size
-                        current_global_batch_size = max(min_batch_size, current_global_batch_size // 2)
-                        attempt_batch_size = current_global_batch_size
-                        
-                        tqdm.write(f"[OOM] Global batch_size: {old_global} → {current_global_batch_size}")
-                        oom_consecutive_count = 0
-                    
-                    # 현재 배치만 축소해서 재시도
-                    retry_size = max(min_batch_size, current_batch_size // 2)
-                    tqdm.write(f"[Retry] With batch_size: {retry_size}")
-                    
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                    
-                    # 재시도
-                    try:
-                        batch_preds, batch_responses = classify_cot_with_auto_batch(
-                            model, tok, batch_prompts,
-                            CONFIG["max_length"], CONFIG["cot_max_new_tokens"],
-                            initial_batch_size=retry_size
-                        )
-                        
-                        for k, i0 in enumerate(b):
-                            if batch_preds[k] in _VALID:
-                                preds[i0] = batch_preds[k]
-                                full_responses[i0] = batch_responses[k]
-                        
-                        s += current_batch_size
-                        
-                    except Exception as e:
-                        tqdm.write(f"[ERROR] Retry failed: {e}")
-                        s += current_batch_size  # 건너뛰기
-            
-            idxs = [i for i in idxs if preds[i] == "?"]
-        
-        # 결과 저장
-        out_df = pd.DataFrame({
-            "pred": preds,
-            "true": true_ans,
-            "correct": [int(p == t) for p, t in zip(preds, true_ans)],
-            "used_question": df[text_field].astype(str).tolist(),
-            "reasoning": full_responses,
-        })
-        out_df.to_csv(out_dir / "predictions.csv", index=False)
-        
-        parsed = sum(p in _VALID for p in preds)
-        acc = float(out_df["correct"].mean())
-        
-        tqdm.write(f"[Result] Accuracy: {acc:.4f} ({int(acc*n)}/{n})")
-        tqdm.write(f"[Result] Parsed: {parsed}/{n}")
-        
-        # Metrics 저장
-        metrics = {
-            "method": "cot",
-            "noise": noise,
-            "level": level,
-            "seed": seed,
-            "accuracy": acc,
-            "num_samples": n,
-            "parsed": parsed,
-            "timestamp": datetime.now().isoformat(),
-            "model_id": CONFIG["model_id"],
-            "prompt_file": CONFIG["prompt_file"],
-            "initial_batch_size": CONFIG["initial_batch_size"],
-            "final_batch_size": current_global_batch_size,
-            "max_length": CONFIG["max_length"],
-            "cot_max_new_tokens": CONFIG["cot_max_new_tokens"],
-            "decode_method": "free_generation",
-            "optimizations": {
-                "flash_attention": CONFIG.get("use_flash_attention", False),
-                "torch_compile": CONFIG.get("use_torch_compile", False),
-                "auto_batch_reduce": CONFIG.get("auto_reduce_batch_size", False),
-            },
-            "input_path": str(p_path),
-            "text_field_used": text_field,
-        }
-        
-        (out_dir / "metrics.json").write_text(
-            json.dumps(metrics, indent=2), encoding="utf-8"
-        )
-
-        # Cleanup
-        del df, out_df, texts, prompts
-        gc.collect()
-        torch.cuda.empty_cache()
+        for seed_name, actual_seed in seed_list:
+            current_global_batch_size = run_single_experiment(
+                model=model,
+                tokenizer=tok,
+                prompt_templ=prompt_templ,
+                p_path=p_path,
+                noise=noise,
+                level=level,
+                seed_name=seed_name,
+                actual_seed=actual_seed,
+                results_root=results_root,
+                current_global_batch_size=current_global_batch_size,
+            )
 
     # Summaries
     generate_all_summaries(str(results_root))
