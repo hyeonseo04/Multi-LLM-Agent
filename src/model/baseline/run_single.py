@@ -370,7 +370,7 @@ def main():
         
         # ✅ Clean 데이터면 5개 seed로 반복 실행
         if noise == "clean":
-            seed_list = [(f"seed_{i}", s) for i, s in enumerate(CONFIG["clean_seeds"])]
+            seed_list = [(f"seed_{i}", s) for i, s in enumerate(CONFIG["clean_seeds"], start=1)]  # ← start=1 추가!
         else:
             # 노이즈 데이터는 원래대로 1번만 (파일명의 seed 사용)
             seed_list = [(seed_orig, CONFIG["default_seed"])]
