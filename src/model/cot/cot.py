@@ -69,12 +69,12 @@ CONFIG = {
     # ========================================
     
     # ─── 모드 1: Clean만 (1-1.5시간) ───
-    #"run_mode": "clean_only",
-    # "target_wer_levels": [],
+    "run_mode": "clean_only",
+    "target_wer_levels": [],
     
     # ─── 모드 2: wer_0.2, wer_0.4만 (10-14시간) ───
-    "run_mode": "wer_only",
-    "target_wer_levels": ["wer_0.4"],
+    #"run_mode": "wer_only",
+    #"target_wer_levels": ["wer_0.4"],
     
     # ─── 모드 3: Clean + wer_0.2, wer_0.4 (11-16시간) ───
     # "run_mode": "clean_and_wer",
@@ -639,7 +639,7 @@ def main():
         
         # ✅ Clean 데이터면 5개 seed로 반복 실행
         if noise == "clean":
-            seed_list = [(f"seed_{i}", s) for i, s in enumerate(CONFIG["clean_seeds"])]
+            seed_list = [(f"seed_{i}", s) for i, s in enumerate(CONFIG["clean_seeds"], start=1)]
         else:
             # 노이즈 데이터는 원래대로 1번만
             seed_list = [(seed_orig, CONFIG["default_seed"])]
