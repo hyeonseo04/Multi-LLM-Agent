@@ -78,7 +78,7 @@ BASE_DIR = BASE_DIR.resolve()
 # Paths & Config
 # -------------------------
 RESULTS_ROOT = BASE_DIR / "results" / "proposed" / "v4"
-PROMPT_DIR   = BASE_DIR / "prompts"          # flat: prompts/<name>.txt  (no version subfolder)
+PROMPT_DIR   = BASE_DIR / "prompts" / "v1"         # flat: prompts/<name>.txt  (no version subfolder)
 DATA_CLEAN   = BASE_DIR / "data" / "raw" / "medqa" / "medqa_all_clean.jsonl"
 DATA_NOISE   = BASE_DIR / "data" / "processed" / "medqa"   # <noise>/<level>/<seed>.jsonl
 
