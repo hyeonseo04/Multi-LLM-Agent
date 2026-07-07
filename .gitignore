@@ -5,8 +5,7 @@ env/
 
 # 데이터
 data/
-data_processed/
-result/
+results/
 
 # 캐시 / 임시파일
 __pycache__/
@@ -24,3 +23,22 @@ __pycache__/
 *.pt
 *.ckpt
 *.bin
+
+results/
+
+# 대용량 / 외부 라이브러리
+flash-attention/
+*.whl
+
+# 빌드 잔해
+*.egg-info/
+src/multiagent.egg-info/
+
+# 데이터 / 결과 (레포에 넣지 않음)
+results/
+result/
+src/noise/test_no_filter/
+src/result/case_study_outputs/
+**/*.jsonl
+src/model/proposed/final_adjudiator.py
+src/model/proposed/model_centric_baseline.py

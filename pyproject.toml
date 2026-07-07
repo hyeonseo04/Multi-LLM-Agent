@@ -1,15 +1,42 @@
 [project]
 name = "multiagent"
 version = "0.1.0"
-description = "Add your description here"
+description = "Multi-agent LLM experiments (stable CUDA setup)"
 readme = "README.md"
 requires-python = ">=3.12"
+
 dependencies = [
+    "numpy==1.26.3",
+    "pandas==2.2.2",
+    "tqdm==4.67.1",
+    "transformers==4.57.1",
+    "accelerate==1.10.1",
+    "tokenizers==0.22.1",
+    "safetensors==0.6.2",
+    "huggingface-hub==0.35.3",
+    # 핵심: uv에서 +cu121 local version 매칭을 위해 === 사용
+    "torch===2.4.1+cu121",
+    "torchvision===0.19.1+cu121",
+    "torchaudio===2.4.1+cu121",
+    "bitsandbytes>=0.49.0",
+    "autoawq>=0.2.9",
+    "hf-transfer>=0.1.9",
     "matplotlib>=3.10.8",
-    "numpy>=2.4.0",
-    "pandas>=2.3.3",
-    "scikit-learn>=1.8.0",
-    "torch>=2.9.1",
-    "torchaudio>=2.9.1",
-    "torchvision>=0.24.1",
+    "flash-attn>=2.8.3",
+    "json-repair>=0.55.0",
+    "seaborn>=0.13.2",
+    "pip>=26.0",
+    "scipy>=1.16.3",
+    "statsmodels>=0.14.6",
 ]
+
+# uv가 PyTorch CUDA wheel 인덱스를 보게 만듦
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
+torchvision = { index = "pytorch-cu121" }
+torchaudio = { index = "pytorch-cu121" }
